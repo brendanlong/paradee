@@ -70,7 +70,7 @@ The inverse STFTs are written as a matrix multiply and a sum of shifted slices
 same speed on CPU, but ONNX Runtime's CUDA backend is very slow at the transposed-convolution form
 of this shape (one output channel, a kernel as long as the FFT): in the released 1.2 file it takes
 about three quarters of the time on a GPU. The released 1.0 to 1.2 files predate this change; with
-it, they run 5 to 7 times faster on a GPU.
+it, they run 5 to 7 times faster on a GPU (v1.0 about 5, v1.2 about 6.5).
 `tests/` checks that the two forms agree (`uv run --with pytest pytest tests`).
 
 ## 5. The v1.1 head
