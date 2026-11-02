@@ -11,6 +11,7 @@ from student_decoder import load_student_decoder
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 import phase_lock
+from ola import overlap_add
 
 ap = argparse.ArgumentParser(); ap.add_argument("--text", default="checkpoints/text_s+mlp/last.pt"); ap.add_argument("--dec", default="checkpoints/dec_A_gan3/last.pt")
 ap.add_argument("--out", default="models/paradee"); ap.add_argument("--L", type=int, default=33)
@@ -52,8 +53,8 @@ class Lock(nn.Module):
         Sm = torch.sqrt(Sr ** 2 + Si ** 2)
         ur, ui = (Er * Rr - Ei * Ri) / (Em * Rm), (Er * Ri + Ei * Rr) / (Em * Rm)            # unit(E) * unit(smoothed)
         Dr, Di = (Sm * ur - Sr) * v, (Sm * ui - Si) * v
-        ola = F.conv_transpose1d(torch.cat([Dr, Di])[None], self.inv, stride=HOP)[0]       # inverse DFT, window, overlap-add
-        env = F.conv_transpose1d(torch.ones(1, 1, nf), self.w2, stride=HOP)[0]
+        ola = overlap_add(torch.cat([Dr, Di])[None], self.inv, HOP)[0]                     # inverse DFT, window, overlap-add
+        env = overlap_add(torch.ones(1, 1, nf), self.w2, HOP)[0]
         d = (ola / env.clamp_min(1e-8))[:, N_FFT // 2: N_FFT // 2 + k]
         return s + d
 
@@ -77,8 +78,8 @@ class ConvSTFT(nn.Module):
         return torch.sqrt(re ** 2 + im ** 2), ph
     def inverse(self, mag, phase):
         z = torch.cat([mag * torch.cos(phase), mag * torch.sin(phase)], 1)
-        y = F.conv_transpose1d(z, self.inv, stride=self.hop)[:, 0]
-        env = F.conv_transpose1d(torch.ones(1, 1, mag.shape[-1]), self.w2, stride=self.hop)[:, 0]
+        y = overlap_add(z, self.inv, self.hop)[:, 0]
+        env = overlap_add(torch.ones(1, 1, mag.shape[-1]), self.w2, self.hop)[:, 0]
         return (y / env.clamp_min(1e-8))[:, self.n // 2: -(self.n // 2)][:, None]
 
 class Paradee(nn.Module):
@@ -146,8 +147,8 @@ from onnx import numpy_helper, helper, TensorProto
 g = onnx.load(path); nq = nh = 0
 fwd = torch.cat([torch.cos(2 * torch.pi * BINS.double()[:, None] * torch.arange(N_FFT).double() / N_FFT),
                  -torch.sin(2 * torch.pi * BINS.double()[:, None] * torch.arange(N_FFT).double() / N_FFT)]) * torch.hann_window(N_FFT, dtype=torch.float64)
-def basis_nodes(name, scale):
-    """[2K,1,N] = cat(cos, -sin)(2 pi k n / N) * hann(n) * scale, with k*n reduced mod N in int64 so fp32 cos stays exact"""
+def basis_nodes(name, scale, shape):
+    """[2K,1,N] or [2K,N] (shape) = cat(cos, -sin)(2 pi k n / N) * hann(n) * scale, with k*n reduced mod N in int64 so fp32 cos stays exact"""
     p = name + "_gen_"; K = len(BINS)
     g.graph.initializer.extend([numpy_helper.from_array(BINS.numpy().astype(np.int64)[:, None], p + "k"), numpy_helper.from_array(np.arange(N_FFT, dtype=np.int64)[None], p + "n"),
         numpy_helper.from_array(np.array(N_FFT, np.int64), p + "N"), numpy_helper.from_array(np.array(2 * np.pi / N_FFT, np.float32), p + "c"),
@@ -156,15 +157,15 @@ def basis_nodes(name, scale):
             helper.make_node("Cast", [p + "m"], [p + "mf"], to=TensorProto.FLOAT), helper.make_node("Mul", [p + "mf", p + "c"], [p + "a"]),
             helper.make_node("Cos", [p + "a"], [p + "cos"]), helper.make_node("Sin", [p + "a"], [p + "sin"]), helper.make_node("Neg", [p + "sin"], [p + "nsin"]),
             helper.make_node("Concat", [p + "cos", p + "nsin"], [p + "cs"], axis=0), helper.make_node("Mul", [p + "cs", p + "w"], [p + "b"]),
-            helper.make_node("Unsqueeze", [p + "b", p + "ax"], [name])], numpy_helper.from_array(np.array([1], np.int64), p + "ax")
+            helper.make_node("Reshape", [p + "b", p + "shape"], [name])], numpy_helper.from_array(np.array(shape, np.int64), p + "shape")
 new_nodes = []
 for init in list(g.graph.initializer):
     w = numpy_helper.to_array(init); name = init.name
     if w.dtype != np.float32: continue
-    if w.shape == (2 * len(BINS), 1, N_FFT):                                          # a DFT basis: forward (scale 1) or inverse (2/N)
+    if w.shape in ((2 * len(BINS), 1, N_FFT), (2 * len(BINS), N_FFT)):              # a DFT basis: forward (scale 1) or inverse (2/N, folded to 2-D by overlap_add)
         scale = float(np.abs(w).max() / fwd.abs().max()); scale = 1.0 if abs(scale - 1) < 1e-3 else 2 / N_FFT
-        assert np.abs(w - fwd[:, None].numpy() * scale).max() < 1e-3 * scale, name   # the stored fp32 bases carry ~1e-4 error from cos of angles up to 2000 rad; the rebuilt ones are exact
-        g.graph.initializer.remove(init); nodes, ax = basis_nodes(name, scale); g.graph.initializer.append(ax); new_nodes += nodes
+        assert np.abs(w.reshape(fwd.shape) - fwd.numpy() * scale).max() < 1e-3 * scale, name   # the stored fp32 bases carry ~1e-4 error from cos of angles up to 2000 rad; the rebuilt ones are exact
+        g.graph.initializer.remove(init); nodes, shp = basis_nodes(name, scale, w.shape); g.graph.initializer.append(shp); new_nodes += nodes
     elif w.ndim >= 2 and w.size >= 1024:
         sc = np.abs(w).reshape(w.shape[0], -1).max(1) / 127; sc[sc == 0] = 1
         q = np.clip(np.round(w / sc.reshape((-1,) + (1,) * (w.ndim - 1))), -127, 127).astype(np.int8)

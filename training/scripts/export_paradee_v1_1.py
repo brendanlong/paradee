@@ -7,6 +7,7 @@ import sys, glob, os, time, argparse, warnings, torch, numpy as np, torch.nn as 
 warnings.filterwarnings("ignore"); sys.path.insert(0, "scripts")
 from student import TextStudent, alignment
 from vhead import VDecoder, SR, FHOP
+from ola import overlap_add
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 ap = argparse.ArgumentParser(); ap.add_argument("dec"); ap.add_argument("--text", default="checkpoints/text_s+mlp/last.pt"); ap.add_argument("--out", default="models/paradee_v1.1")
@@ -21,7 +22,7 @@ def strip(m):
             except Exception: pass
 
 class ConvSTFT(nn.Module):
-    """torch.stft / torch.istft (hann, centre, reflect) as conv1d / conv_transpose1d with real and imaginary parts kept apart."""
+    """torch.stft / torch.istft (hann, centre, reflect) as conv1d / overlap_add with real and imaginary parts kept apart."""
     def __init__(self, n, hop):
         super().__init__(); self.n, self.hop, self.K = n, hop, n // 2 + 1; w = torch.hann_window(n, dtype=torch.float64); k = torch.arange(self.K, dtype=torch.float64)[:, None]
         ang = 2 * torch.pi * ((k * torch.arange(n, dtype=torch.float64)) % n) / n; c = torch.full((self.K, 1), 2.0, dtype=torch.float64); c[0] = c[-1] = 1
@@ -30,8 +31,8 @@ class ConvSTFT(nn.Module):
     def transform(self, x):   # [B,S] -> re, im [B,K,frames]
         y = F.conv1d(F.pad(x[:, None], (self.n // 2, self.n // 2), mode="reflect"), self.fwd, stride=self.hop); return y[:, :self.K], y[:, self.K:]
     def inverse(self, re, im):
-        y = F.conv_transpose1d(torch.cat([re, im], 1), self.inv, stride=self.hop)[:, 0]
-        env = F.conv_transpose1d(torch.ones_like(re[:1, :1]), self.w2, stride=self.hop)[:, 0]
+        y = overlap_add(torch.cat([re, im], 1), self.inv, self.hop)[:, 0]
+        env = overlap_add(torch.ones_like(re[:1, :1]), self.w2, self.hop)[:, 0]
         return (y / env.clamp_min(1e-8))[:, self.n // 2: -(self.n // 2)]
 
 class HeadX(nn.Module):
@@ -118,23 +119,24 @@ def basis(n, inverse):
     w = torch.hann_window(n, dtype=torch.float64); k = torch.arange(n // 2 + 1, dtype=torch.float64)[:, None]; ang = 2 * torch.pi * ((k * torch.arange(n, dtype=torch.float64)) % n) / n
     c = torch.full((n // 2 + 1, 1), 2.0, dtype=torch.float64); c[0] = c[-1] = 1
     return ((torch.cat([torch.cos(ang) * c, -torch.sin(ang) * c]) / n * w) if inverse else (torch.cat([torch.cos(ang), -torch.sin(ang)]) * w)).float()[:, None].numpy()
-def basis_nodes(name, n, inverse):
-    """[2K,1,n] = cat(cos, -sin)(2 pi k t / n) * per-row scale * hann(t), with k*t reduced mod n in int64 so fp32 cos stays exact"""
+def basis_nodes(name, n, inverse, shape):
+    """[2K,1,n] or [2K,n] (shape) = cat(cos, -sin)(2 pi k t / n) * per-row scale * hann(t), with k*t reduced mod n in int64 so fp32 cos stays exact"""
     p = name + "_gen_"; K = n // 2 + 1; row = np.ones((2 * K, 1), np.float32)
     if inverse: row[:] = 2 / n; row[[0, K - 1, K, 2 * K - 1]] = 1 / n
     g.graph.initializer.extend([numpy_helper.from_array(np.arange(K, dtype=np.int64)[:, None], p + "k"), numpy_helper.from_array(np.arange(n, dtype=np.int64)[None], p + "n"),
         numpy_helper.from_array(np.array(n, np.int64), p + "N"), numpy_helper.from_array(np.array(2 * np.pi / n, np.float32), p + "c"),
-        numpy_helper.from_array(torch.hann_window(n).numpy()[None], p + "w"), numpy_helper.from_array(row, p + "row"), numpy_helper.from_array(np.array([1], np.int64), p + "ax")])
+        numpy_helper.from_array(torch.hann_window(n).numpy()[None], p + "w"), numpy_helper.from_array(row, p + "row"), numpy_helper.from_array(np.array(shape, np.int64), p + "shape")])
     return [helper.make_node("Mul", [p + "k", p + "n"], [p + "kn"]), helper.make_node("Mod", [p + "kn", p + "N"], [p + "m"]),
             helper.make_node("Cast", [p + "m"], [p + "mf"], to=TensorProto.FLOAT), helper.make_node("Mul", [p + "mf", p + "c"], [p + "a"]),
             helper.make_node("Cos", [p + "a"], [p + "cos"]), helper.make_node("Sin", [p + "a"], [p + "sin"]), helper.make_node("Neg", [p + "sin"], [p + "nsin"]),
             helper.make_node("Concat", [p + "cos", p + "nsin"], [p + "cs"], axis=0), helper.make_node("Mul", [p + "cs", p + "w"], [p + "b0"]), helper.make_node("Mul", [p + "b0", p + "row"], [p + "b"]),
-            helper.make_node("Unsqueeze", [p + "b", p + "ax"], [name])]
+            helper.make_node("Reshape", [p + "b", p + "shape"], [name])]
 for init in list(g.graph.initializer):
     w = numpy_helper.to_array(init); name = init.name
     if w.dtype != np.float32: continue
-    hit = [(n, inv) for n in (600, 150) for inv in (False, True) if w.shape == (n + 2, 1, n) and np.abs(w - basis(n, inv)).max() < 1e-4 * np.abs(w).max()]
-    if hit: g.graph.initializer.remove(init); new_nodes += basis_nodes(name, *hit[0]); nb += 1
+    hit = [(n, inv) for n in (600, 150) for inv in (False, True) if w.shape in ((n + 2, 1, n), (n + 2, n))   # overlap_add's MatMul folds the inverse basis to 2-D
+           and np.abs(w.reshape(n + 2, 1, n) - basis(n, inv)).max() < 1e-4 * np.abs(w).max()]
+    if hit: g.graph.initializer.remove(init); new_nodes += basis_nodes(name, *hit[0], w.shape); nb += 1
     elif w.ndim >= 2 and w.size >= 1024:
         sc = np.abs(w).reshape(w.shape[0], -1).max(1) / 127; sc[sc == 0] = 1
         q = np.clip(np.round(w / sc.reshape((-1,) + (1,) * (w.ndim - 1))), -127, 127).astype(np.int8); g.graph.initializer.remove(init)

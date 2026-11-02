@@ -65,6 +65,14 @@ Kokoro ships an ONNX-friendly STFT (`kokoro.custom_stft.CustomSTFT`). It does no
 `torch.stft`, which the decoder was trained with, and it costs about 0.5 UTMOS. The export uses
 its own exact version (`ConvSTFT`) instead.
 
+The inverse STFTs are written as a matrix multiply and a sum of shifted slices
+(`scripts/ola.py`) rather than `conv_transpose1d`. The two give the same result, and run at the
+same speed on CPU, but ONNX Runtime's CUDA backend is very slow at the transposed-convolution form
+of this shape (one output channel, a kernel as long as the FFT): in the released 1.2 file it takes
+about three quarters of the time on a GPU. The released 1.0 to 1.2 files predate this change; with
+it, they run 5 to 7 times faster on a GPU.
+`tests/` checks that the two forms agree (`uv run --with pytest pytest tests`).
+
 ## 5. The v1.1 head
 
 Version 1.1 keeps the text side and the first part of decoder A, and replaces the audio generator
